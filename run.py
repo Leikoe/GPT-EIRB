@@ -11,7 +11,7 @@ if __name__ == '__main__':
     parser.add_argument("--weights", type=str, default="./gpteirb.bin", help="Path to the downloaded weights")
     args = parser.parse_args()
 
-    model = GPTeirb()
+    model = GPTeirb()   # TODO: comment this and uncomment below
     # model = GPTeirb.from_weights(args.weights)
 
     toks = [model.tokenizer.bos_id()]
