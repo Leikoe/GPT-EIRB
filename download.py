@@ -26,7 +26,7 @@ def download_file(url: str, fname: str, chunk_size=1024):
             bar.update(size)
 
 
-def download():
+def download_dataset():
     """Downloads the TinyStories dataset to DATA_CACHE_DIR"""
     os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 
@@ -64,4 +64,18 @@ def download():
     print("Download done.")
 
 
-download()
+download_dataset()
+
+
+def download_tokenizer():
+    # download the TinyStories dataset, unless it's already downloaded
+    data_url = "https://huggingface.co/karpathy/tinyllamas/resolve/main/stories260K/tok512.model?download=true"
+    data_filename = os.path.join(DATA_CACHE_DIR, "tok512.model")
+    if not os.path.exists(data_filename):
+        print(f"Downloading {data_url} to {data_filename}...")
+        download_file(data_url, data_filename)
+    else:
+        print(f"{data_filename} already exists, skipping download...")
+
+
+download_tokenizer()
