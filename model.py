@@ -1,13 +1,17 @@
 import pickle
 import time
 from typing import Self, List
+from sklearn.neighbors import KNeighborsClassifier
+
 from tokenizer import tokenizer
 
 
 class GPTeirb:
     tokenizer = tokenizer
-    def __init__(self):
-        pass
+
+    def __init__(self, train_ncd: List[List[float]], Y: List[int]):
+        self.neigh = KNeighborsClassifier(n_neighbors=7)
+        self.neigh.fit(train_ncd, Y)
 
     @classmethod
     def from_weights(cls, path: str) -> Self:
