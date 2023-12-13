@@ -52,6 +52,7 @@ def download():
     if not os.path.exists(data_filename):
         print(f"Creating {data_filename}...")
         shard_filenames = sorted(glob.glob(os.path.join(data_dir, "*.json")))
+        # only shard 0 is used for now
         with open(shard_filenames[0], "r") as f:
             data = json.load(f)
             with open(data_filename, "w") as out_f:
