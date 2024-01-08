@@ -12,7 +12,10 @@ class Timing(contextlib.ContextDecorator):
         self.on_exit = on_exit
         self.enabled = enabled
 
-    def __enter__(self): self.st = time.perf_counter_ns()
+    def __enter__(self): 
+        if self.enabled:
+            print(f"{self.prefix}...", end="", flush=True)
+        self.st = time.perf_counter_ns()
 
     def __exit__(self, *exc):
         self.et = time.perf_counter_ns() - self.st

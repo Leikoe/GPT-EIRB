@@ -17,9 +17,9 @@ import time
 import numpy as np
 import tqdm
 from sklearn.neighbors import KNeighborsClassifier
-from tokenizer import tokenizer
 from utils import Timing
 import humanize
+from more_itertools import flatten
 
 def chunks(lst, n):
     """Yield successive n-sized chunks from lst."""
@@ -43,30 +43,39 @@ gpu_compressor = _get_codec(GDEFLATE_ALGO)
 
 
 # hyperparameters
-n_train = 1000
+n_train = 10000
 n_batch = 1
-n_ctx = 8  # what is the maximum context length for predictions?
-n_vocab = tokenizer.vocab_size()
+n_ctx = 64  # what is the maximum context length for predictions?
 temp = 0.800000
 top_k = 40
 top_p = 0.950000
+# ------------
 
-
-print(f"n_vocab = {n_vocab}")
-print(f"n_ctx   = {n_ctx}")
 
 # wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
 with open('input.txt', 'r', encoding='utf-8') as f:
-    text = f.read()[:]
+    text = f.read()
+
+# here are all the unique characters that occur in this text
+chars = sorted(list(set(text)))
+vocab_size = len(chars)
+# create a mapping from characters to integers
+stoi = { ch:i for i,ch in enumerate(chars) }
+itos = { i:ch for i,ch in enumerate(chars) }
+encode = lambda s: [stoi[c] for c in s] # encoder: take a string, output a list of integers
+decode = lambda l: ''.join([itos[i] for i in l]) # decoder: take a list of integers, output a string
 
 # Train and test splits
-data = np.array(tokenizer.encode(text), dtype=np.uint64)
-print(f"n_train = {len(data)}")
-print()
-
-n = int(0.9 * len(data))  # first 90% will be train, rest val
+data = cp.array(encode(text), dtype=cp.uint8)
+n = int(0.9*len(data)) # first 90% will be train, rest val
 train_data = data[:n]
 val_data = data[n:]
+
+
+print(f"n_ctx   = {n_ctx}")
+print(f"n_vocab = {len(chars)}")
+print(f"train_data.shape = {train_data.shape}")
+print(f"val_data.shape   = {val_data.shape}")
 
 
 # data loading
@@ -78,10 +87,18 @@ def get_batch(split):
     y = np.stack([data[i+1:i+n_ctx+1] for i in ix])
     return x, y
 
+def get_example(split):
+    # generate an example of input x and target y
+    data = train_data if split == 'train' else val_data
+    i = np.random.randint(0, len(data) - n_ctx)
+    x = data[i:i+n_ctx]
+    y = data[i+1:i+n_ctx+1]
+    return x, y
 
+   
 def encode_batch_size(codec: NvCompBatchCodec, bufs: Sequence[Any]) -> Sequence[Any]: 
     num_chunks = len(bufs)
-    chunks_size = sum(map(len, bufs)) # map each buffer to it's size, then sum
+    # chunks_size = sum(map(len, bufs)) # map each buffer to it's size, then sum
     # print(f"[encode_batch_size] chunk_size = {humanize.naturalsize(chunks_size)}")
     # print(f"[encode_batch_size] num_chunks = {num_chunks}")
     if num_chunks == 0:
@@ -133,53 +150,8 @@ def encode_batch_size(codec: NvCompBatchCodec, bufs: Sequence[Any]) -> Sequence[
     return res
 
 
-def find_last_index_before_threshold(arr, threshold):
-    cumsum = np.cumsum(arr)
-    indices = np.where(cumsum <= threshold)[0]
-    return indices[-1] if indices.size > 0 else None
-
-
-def encode_batch_size_chunked(codec: NvCompBatchCodec, bufs: Sequence[Any]) -> Sequence[Any]: 
-    with cp.cuda.Device(0) as gpu0:
-        memory_free, memory_total = gpu0.mem_info
-        # print("[encode_batch_size_chunked] memory_free = ", humanize.naturalsize(memory_free))
-        # print("[encode_batch_size_chunked] memory_total = ", humanize.naturalsize(memory_total))
-
-    # Initialize the starting index and results list
-    start_index = 0
-    results = []
-
-    MAX_CHUNK_SIZE = 50 * 1024 * 1024 # 50 MB
-
-    # While there are still buffers to process
-    # pbar = tqdm.tqdm(total=len(bufs))
-    while start_index < len(bufs):
-        # print(f"[encode_batch_size_chunked] start_index = {start_index}")
-        # Find the first index that exceeds the memory limit
-        # end_index = find_last_index_before_threshold(list(map(len, bufs[start_index:])), MAX_CHUNK_SIZE) + 1
-        end_index = 100
-        # print(f"[encode_batch_size_chunked] end_index = {end_index}")
-
-        # If no such index is found, process the rest of the buffers
-        if end_index is None:
-            end_index = len(bufs) - start_index
-
-        # Get the current chunk of buffers
-        chunk = bufs[start_index:start_index + end_index]
-
-        # Encode the chunk
-        result = encode_batch_size(codec, chunk)
-
-        # Add the result to the results list
-        results.extend(result)
-
-        # Update the start index for the next iteration
-        start_index += end_index
-        # pbar.update(end_index)
-    # pbar.close()
-
-    # Return the results
-    return results
+def encode_batch_size_chunked(codec: NvCompBatchCodec, bufs: Sequence[Any]) -> Sequence[Any]:
+    return flatten(map(lambda chunk: encode_batch_size(codec, chunk), chunks(bufs, 100)))
 
 
 def ncd_fast(x: bytes, x_compressed: int, x2: bytes, x2_compressed: int):  # NCD with compressed lengths
@@ -190,23 +162,27 @@ def ncd_fast(x: bytes, x_compressed: int, x2: bytes, x2_compressed: int):  # NCD
 XS = []
 YS = []
 for i in range(n_train):
-    x, y = get_batch("train")
-    x = x[0]
-    y = y[0]
-
+    x, y = get_example("train")
     for token_idx in range(n_ctx):
         context = x[:token_idx + 1]
         target = y[token_idx]
-        # print(f"when context is '{tokenizer.decode(context.tolist())}', target is '{tokenizer.decode(target.tolist())}'")
+        print(f"when context is '{decode(context.tolist())}', target is '{decode([target.tolist()])}'")
         XS.append(context.tobytes())
         YS.append(target)
 
-print("compressing xs..")
-XS_compressed = encode_batch_size_chunked(gpu_compressor, XS)
-print(f"Total examples: {len(XS_compressed)}")
+exit(0)
+
+with Timing("compressing examples: "):
+    XS_compressed_lens = list(encode_batch_size_chunked(gpu_compressor, XS))
+print(f"Total examples: {len(XS_compressed_lens)}")
 
 print("compressing pairs..")
 compressed_pairs = []
+
+for x1 in XS_compressed_lens:
+    print(x1)
+
+exit(0)
 
 for chunk in tqdm.tqdm(chunks(XS, 10), desc="compressing pairs"):
     ee = [b"".join([x1, x2]) for x1 in chunk for x2 in XS]
