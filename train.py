@@ -38,14 +38,13 @@ def _get_codec(algo: str, **kwargs):
     codec_args = {"id": "nvcomp_batch", "algorithm": algo, "options": kwargs}
     return numcodecs.registry.get_codec(codec_args)
 
-gpu_compressor = _get_codec(GDEFLATE_ALGO)
+gpu_compressor = _get_codec(ZSTD_ALGO)
 
 
 
 # hyperparameters
 n_train = 10000
-n_batch = 1
-n_ctx = 64  # what is the maximum context length for predictions?
+n_ctx = 8  # what is the maximum context length for predictions?
 temp = 0.800000
 top_k = 40
 top_p = 0.950000
@@ -77,15 +76,6 @@ print(f"n_vocab = {len(chars)}")
 print(f"train_data.shape = {train_data.shape}")
 print(f"val_data.shape   = {val_data.shape}")
 
-
-# data loading
-def get_batch(split):
-    # generate a small batch of data of inputs x and targets y
-    data = train_data if split == 'train' else val_data
-    ix = np.random.randint(0, len(data) - n_ctx, (n_batch,))
-    x = np.stack([data[i:i+n_ctx] for i in ix])
-    y = np.stack([data[i+1:i+n_ctx+1] for i in ix])
-    return x, y
 
 def get_example(split):
     # generate an example of input x and target y
@@ -166,27 +156,23 @@ for i in range(n_train):
     for token_idx in range(n_ctx):
         context = x[:token_idx + 1]
         target = y[token_idx]
-        print(f"when context is '{decode(context.tolist())}', target is '{decode([target.tolist()])}'")
+        # print(f"when context is '{decode(context.tolist())}', target is '{decode([target.tolist()])}'")
         XS.append(context.tobytes())
         YS.append(target)
 
-exit(0)
-
-with Timing("compressing examples: "):
+with Timing("compressing examples"):
     XS_compressed_lens = list(encode_batch_size_chunked(gpu_compressor, XS))
 print(f"Total examples: {len(XS_compressed_lens)}")
 
 print("compressing pairs..")
 compressed_pairs = []
 
-for x1 in XS_compressed_lens:
-    print(x1)
+for x1 in tqdm.tqdm(XS):
+    compressed_pairs.append(encode_batch_size_chunked(gpu_compressor, [b"".join([x1, x2]) for x2 in XS]))
 
-exit(0)
-
-for chunk in tqdm.tqdm(chunks(XS, 10), desc="compressing pairs"):
-    ee = [b"".join([x1, x2]) for x1 in chunk for x2 in XS]
-    compressed_pairs.extend(encode_batch_size_chunked(gpu_compressor, ee))
+# for chunk in tqdm.tqdm(chunks(XS, 10), desc="compressing pairs"):
+#     ee = [b"".join([x1, x2]) for x1 in chunk for x2 in XS]
+#     compressed_pairs.extend(encode_batch_size_chunked(gpu_compressor, ee))
 
 print(compressed_pairs[:10])
 
