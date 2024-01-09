@@ -49,8 +49,8 @@ cpu_compressor = numcodecs.registry.get_codec({"id": USED_ALGO.lower()})
 
 
 # hyperparameters
-n_train = 5000
-n_ctx = 16  # what is the maximum context length for predictions?
+n_train = 10000
+n_ctx = 8  # what is the maximum context length for predictions?
 # ------------
 
 
@@ -119,7 +119,7 @@ def encode_batch_size(codec: NvCompBatchCodec, bufs: Sequence[Any]) -> np.ndarra
     # uncomp_chunks is used as a container that stores pointers to actual chunks.
     # nvCOMP requires this and sizes buffers to be in GPU memory.
     print("preparing data and size buffers")
-    uncomp_chunks = cp.array(np.cumsum(buf_sizes) + buf.data.ptr, dtype=cp.uintp)
+    uncomp_chunks = cp.array(np.concatenate((np.array([0]), np.cumsum(buf_sizes)[:-1])) + int(buf.data.ptr), dtype=cp.uintp)
     uncomp_chunk_sizes = cp.array(buf_sizes, dtype=cp.uint64)
 
     temp_buf = cp.empty(temp_size, dtype=cp.uint8)
@@ -168,15 +168,13 @@ for i in range(n_train):
 with Timing("compressing examples"):
     XS_compressed_lens = encode_batch_size(gpu_compressor, XS)
 
-print(XS_compressed_lens)
-
 print(f"Total examples: {len(XS_compressed_lens)}")
 
 
 # making the model
 
 compressed_pairs = np.empty((len(XS), len(XS)), dtype=np.float16) # those are the compressed lengths
-STEP = 10
+STEP = 100
 print(f"compressing {STEP} lines of {len(XS)} elements at a time (total {STEP*len(XS)} pairs each time)")
 with Timing("compressing pairs.."):
     for i in tqdm.tqdm(range(0, len(XS), STEP)):
@@ -187,13 +185,11 @@ with Timing("compressing pairs.."):
         # compressed_chunk = cp.array(list(encode_batch_size_chunked(gpu_compressor, data, batch_size=10000)))
         compressed_pairs[i: i + STEP] = compressed_chunk.reshape((STEP, len(XS)))
 
-#ncd_scores = np.empty((len(XS), len(XS)), dtype=np.float32) # those are the normalized compression distances
-ncd_scores = compressed_pairs
+ncd_scores = compressed_pairs # reuse the same array
 with Timing("computing ncds"):
     for i in range(len(compressed_pairs)):
         for j in range(len(compressed_pairs)):
             compressed_pairs[i, j] = ncd(XS_compressed_lens[i], XS_compressed_lens[j], compressed_pairs[i, j])
-            # ncd_scores[i, j] = ncd(XS_compressed_lens[i], XS_compressed_lens[j], compressed_pairs[i, j])
 
 print(ncd_scores)
 
@@ -206,9 +202,9 @@ def generate(knn: KNeighborsClassifier, context: np.ndarray, max_new_tokens: int
     for _ in range(max_new_tokens):
         # crop idx to the last block_size tokens
         idx_cond = context[-n_ctx:]
-        idx_cond_compressed = encode_batch_size(gpu_compressor, [idx_cond.tobytes()])[0]
+        idx_cond_compressed = encode_batch_size(gpu_compressor, [idx_cond])[0]
 
-        cmps = encode_batch_size(gpu_compressor, [np.concatenate((idx_cond.tobytes(), np.array([0], dtype=np.uint8), x2)) for x2 in XS])
+        cmps = encode_batch_size(gpu_compressor, [np.concatenate((idx_cond, np.array([0], dtype=np.uint8), x2)) for x2 in XS])
         _ncd_scores = np.array([ncd(idx_cond_compressed, XS_compressed_lens[i], cmps[i]) for i in range(len(XS_compressed_lens))])
 
         # get the predictions
@@ -233,7 +229,7 @@ neigh.fit(ncd_scores, YS)
 np.save("model_ncd_scores", ncd_scores)
 np.save("model_ys", YS)
 
-neigh.classes_ = np.arange(n_vocab, dtype=np.int64)
+neigh.classes_ = np.arange(n_vocab, dtype=np.uint8)
 
 prompt = "Citi"
 context = np.array(encode(prompt), dtype=np.uint8)
