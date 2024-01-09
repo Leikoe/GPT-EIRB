@@ -119,7 +119,7 @@ def encode_batch_size(codec: NvCompBatchCodec, bufs: Sequence[Any]) -> np.ndarra
     # uncomp_chunks is used as a container that stores pointers to actual chunks.
     # nvCOMP requires this and sizes buffers to be in GPU memory.
     print("preparing data and size buffers")
-    uncomp_chunks = cp.array(np.cumsum(buf_sizes) + buf.data.ptr, dtype=cp.)
+    uncomp_chunks = cp.array(np.cumsum(buf_sizes) + buf.data.ptr, dtype=cp.uintp)
     uncomp_chunk_sizes = cp.array(buf_sizes, dtype=cp.uint64)
 
     temp_buf = cp.empty(temp_size, dtype=cp.uint8)
@@ -167,6 +167,8 @@ for i in range(n_train):
 
 with Timing("compressing examples"):
     XS_compressed_lens = encode_batch_size(gpu_compressor, XS)
+
+print(XS_compressed_lens)
 
 print(f"Total examples: {len(XS_compressed_lens)}")
 
