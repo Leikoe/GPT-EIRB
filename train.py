@@ -2,6 +2,7 @@
 #   takes a dataset generated from download.py (.txt) and creates a model
 #
 
+from itertools import islice
 from typing import Any, Sequence
 from numcodecs.compat import ensure_contiguous_ndarray_like
 from kvikio._lib.libnvcomp_ll import SUPPORTED_ALGORITHMS
@@ -21,33 +22,35 @@ from utils import Timing
 import humanize
 from more_itertools import flatten
 
-def chunks(lst, n):
-    """Yield successive n-sized chunks from lst."""
-    for i in range(0, len(lst), n):
-        yield lst[i:i + n]
+def batched(iterable, n):
+    "Batch data into tuples of length n. The last batch may be shorter."
+    # batched('ABCDEFG', 3) --> ABC DEF G
+    if n < 1:
+        raise ValueError('n must be at least one')
+    it = iter(iterable)
+    while (batch := tuple(islice(it, n))):
+        yield batch
 
 
 print(f"{SUPPORTED_ALGORITHMS=}")
+
+
+NVCOMP_CODEC_ID = "nvcomp_batch"
 
 LZ4_ALGO = "LZ4"
 GDEFLATE_ALGO = "Gdeflate"
 SNAPPY_ALGO = "snappy"
 ZSTD_ALGO = "zstd"
 
-def _get_codec(algo: str, **kwargs):
-    codec_args = {"id": "nvcomp_batch", "algorithm": algo, "options": kwargs}
-    return numcodecs.registry.get_codec(codec_args)
+USED_ALGO = LZ4_ALGO
 
-gpu_compressor = _get_codec(ZSTD_ALGO)
-
+gpu_compressor = numcodecs.registry.get_codec(dict(id=NVCOMP_CODEC_ID, algorithm=LZ4_ALGO))
+cpu_compressor = numcodecs.registry.get_codec({"id": USED_ALGO.lower()})
 
 
 # hyperparameters
-n_train = 10000
+n_train = 1000
 n_ctx = 8  # what is the maximum context length for predictions?
-temp = 0.800000
-top_k = 40
-top_p = 0.950000
 # ------------
 
 
@@ -63,22 +66,25 @@ stoi = { ch:i for i,ch in enumerate(chars) }
 itos = { i:ch for i,ch in enumerate(chars) }
 encode = lambda s: [stoi[c] for c in s] # encoder: take a string, output a list of integers
 decode = lambda l: ''.join([itos[i] for i in l]) # decoder: take a list of integers, output a string
+n_vocab = len(stoi)
 
 # Train and test splits
-data = cp.array(encode(text), dtype=cp.uint8)
+data = np.array(encode(text), dtype=np.uint8)
 n = int(0.9*len(data)) # first 90% will be train, rest val
 train_data = data[:n]
 val_data = data[n:]
 
 
 print(f"n_ctx   = {n_ctx}")
-print(f"n_vocab = {len(chars)}")
+print(f"n_vocab = {n_vocab}")
 print(f"train_data.shape = {train_data.shape}")
 print(f"val_data.shape   = {val_data.shape}")
 
 
 def get_example(split):
-    # generate an example of input x and target y
+    """
+    Get a random example from the dataset.
+    """
     data = train_data if split == 'train' else val_data
     i = np.random.randint(0, len(data) - n_ctx)
     x = data[i:i+n_ctx]
@@ -86,7 +92,11 @@ def get_example(split):
     return x, y
 
    
-def encode_batch_size(codec: NvCompBatchCodec, bufs: Sequence[Any]) -> Sequence[Any]: 
+def encode_batch_size(codec: NvCompBatchCodec, bufs: Sequence[Any]) -> np.ndarray: 
+    """
+    Compresses a batch of buffers using the given codec.
+    returns the compressed sizes of each buffer in the batch, in bytes.
+    """
     num_chunks = len(bufs)
     # chunks_size = sum(map(len, bufs)) # map each buffer to it's size, then sum
     # print(f"[encode_batch_size] chunk_size = {humanize.naturalsize(chunks_size)}")
@@ -128,27 +138,18 @@ def encode_batch_size(codec: NvCompBatchCodec, bufs: Sequence[Any]) -> Sequence[
         codec._stream,
     )
 
-    res = []
     # Copy to host to subsequently avoid many smaller D2H copies.
-    # comp_chunks = cp.asnumpy(comp_chunks, codec._stream)
-    comp_chunk_sizes = cp.asnumpy(comp_chunk_sizes, codec._stream)
+    comp_chunk_sizes = cp.asnumpy(comp_chunk_sizes, codec._stream) # copy gpu -> cpu
     codec._stream.synchronize()
 
-    for i in range(num_chunks):
-        # res.append(comp_chunks[i, : comp_chunk_sizes[i]].tobytes())
-        res.append(comp_chunk_sizes[i])
-    return res
+    return comp_chunk_sizes[:num_chunks]
 
 
-def encode_batch_size_chunked(codec: NvCompBatchCodec, bufs: Sequence[Any]) -> Sequence[Any]:
-    return flatten(map(lambda chunk: encode_batch_size(codec, chunk), chunks(bufs, 100)))
+def ncd(len_x1, len_x2, len_x1x2):
+    return (len_x1x2 - min(len_x1, len_x2)) / max(len_x1, len_x2)
 
 
-def ncd_fast(x: bytes, x_compressed: int, x2: bytes, x2_compressed: int):  # NCD with compressed lengths
-    xx2 = len(gpu_compressor.encode(b" ".join([x, x2])))
-    return (xx2 - min(x_compressed, x2_compressed)) / max(x_compressed, x2_compressed)
-
-
+# creating training set
 XS = []
 YS = []
 for i in range(n_train):
@@ -161,98 +162,78 @@ for i in range(n_train):
         YS.append(target)
 
 with Timing("compressing examples"):
-    XS_compressed_lens = list(encode_batch_size_chunked(gpu_compressor, XS))
+    XS_compressed_lens = encode_batch_size(gpu_compressor, XS)
+
 print(f"Total examples: {len(XS_compressed_lens)}")
 
-print("compressing pairs..")
-compressed_pairs = []
 
-for x1 in tqdm.tqdm(XS):
-    compressed_pairs.append(encode_batch_size_chunked(gpu_compressor, [b"".join([x1, x2]) for x2 in XS]))
+# making the model
 
-# for chunk in tqdm.tqdm(chunks(XS, 10), desc="compressing pairs"):
-#     ee = [b"".join([x1, x2]) for x1 in chunk for x2 in XS]
-#     compressed_pairs.extend(encode_batch_size_chunked(gpu_compressor, ee))
+compressed_pairs = np.empty((len(XS), len(XS)), dtype=cp.uint32) # those are the compressed lengths
+STEP = 1
+print(f"compressing {STEP} lines of {len(XS)} elements at a time (total {STEP*len(XS)} pairs each time)")
+with Timing("compressing pairs.."):
+    for i in tqdm.tqdm(range(0, len(XS), STEP)):
+        chunk = XS[i: i + STEP]
+        data = [b" ".join([x1, x2]) for x1 in chunk for x2 in XS]
 
-print(compressed_pairs[:10])
+        compressed_chunk = encode_batch_size(gpu_compressor, data)
+        # compressed_chunk = cp.array(list(encode_batch_size_chunked(gpu_compressor, data, batch_size=10000)))
+        compressed_pairs[i: i + STEP] = compressed_chunk.reshape((STEP, len(XS)))
 
-exit(0)
+ncd_scores = np.empty((len(XS), len(XS)), dtype=np.float32) # those are the normalized compression distances
+with Timing("computing ncds"):
+    for i in range(len(compressed_pairs)):
+        for j in range(len(compressed_pairs)):
+            ncd_scores[i, j] = ncd(XS_compressed_lens[i], XS_compressed_lens[j], compressed_pairs[i, j])
 
-aa = zip(map(len, compressed_pairs), [(x_compressed, x2_compressed) for x_compressed in map(len, XS_compressed) for x2_compressed in map(len, XS_compressed)])
-train_ncd = [(xx2 - min(x_compressed, x2_compressed)) / max(x_compressed, x2_compressed) for (xx2, (x_compressed, x2_compressed)) in aa]
-print(len(train_ncd))
-print("DONEEEEE")
-
-# def nomnom_fast(i):
-    # return [ncd_fast(*X[i], *X[j]) for j in range(len(X))]
-
-
-# train_ncd = [nomnom_fast(i) for i in tqdm.tqdm(range(len(X)), desc="creating model")]
-
-# remote_tqdm = ray.remote(tqdm_ray.tqdm)
-# bar = remote_tqdm.remote(total=len(X), desc="creating model")
-# train_ncd = ray.get([nomnom_fast.remote(bar, i) for i in range(len(X))])
-# bar.close.remote()
-# time.sleep(0.1)
-# ray.shutdown()
-
-
-def softmax(x):
-    """Compute softmax values for each sets of scores in x."""
-    e_x = np.exp(x - np.max(x))
-    return e_x / e_x.sum()
-
-
-def inv_softmax(x, C):
-    return np.log(x) + C
+print(ncd_scores)
 
 
 def generate(knn: KNeighborsClassifier, context: np.ndarray, max_new_tokens: int, streaming=False, temperature=1.0,
              top_k=None):
     if streaming:
-        print(tokenizer.decode(context), end="")
+        print(decode(context), end="")
     # idx is (B, T) array of indices in the current context
     for _ in range(max_new_tokens):
         # crop idx to the last block_size tokens
         idx_cond = context[-n_ctx:]
-        idx_cond_compressed = len(gpu_compressor.encode(idx_cond.tobytes()))
+        idx_cond_compressed = encode_batch_size(gpu_compressor, [idx_cond.tobytes()])[0]
+
+        cmps = encode_batch_size(gpu_compressor, [b" ".join([idx_cond.tobytes(), x2]) for x2 in XS])
+        _ncd_scores = np.array([ncd(idx_cond_compressed, XS_compressed_lens[i], cmps[i]) for i in range(len(XS_compressed_lens))])
 
         # get the predictions
-        ncd_scores = np.array([ncd_fast(idx_cond.tobytes(), idx_cond_compressed, *x2) for x2 in X])
-        probs: np.ndarray = knn.predict_proba([ncd_scores])
+        probs: np.ndarray = knn.predict_proba([_ncd_scores])
 
         # pluck the logits at the final step and scale by desired temperature
-        probs = inv_softmax(probs + 0.1, 0)
-        probs /= temperature
-        probs = softmax(probs)
-        # sample from the distribution
-        if top_k is not None:
-            topk_idxs = (-probs).argsort()[:top_k]
-            idx_next = np.random.choice(knn.classes_[topk_idxs], 1, p=probs[0][topk_idxs])  # (B, 1)
-        else:
-            idx_next = np.random.choice(knn.classes_, 1, p=probs[0])  # (B, 1)
+        idx_next = np.random.choice(knn.classes_, 1, p=probs[0])  # (B, 1)
         # append sampled index to the running sequence
         context = np.concatenate((context, idx_next))  # (B, T+1)
         if streaming:
-            print(tokenizer.decode(idx_next), end=" ")
+            print(decode(idx_next), end="", flush=True)
+    if streaming:
+        print("\n")
     return context
 
 
-neigh = KNeighborsClassifier(n_neighbors=7)
-neigh.fit(train_ncd, Y)
-np.save("model", [train_ncd, Y])
-# neigh.classes_ = np.arange(n_vocab, dtype=np.int64)
+ncd_scores = np.array(ncd_scores, dtype=np.float32)
+YS = np.array(YS, dtype=np.uint8)
 
-prompt = "Speak"
-context = np.array(tokenizer.encode(prompt), dtype=np.int64)
+neigh = KNeighborsClassifier(n_neighbors=7)
+neigh.fit(ncd_scores, YS)
+np.save("model_ncd_scores", ncd_scores)
+np.save("model_ys", YS)
+
+neigh.classes_ = np.arange(n_vocab, dtype=np.int64)
+
+prompt = "Citi"
+context = np.array(encode(prompt), dtype=np.uint8)
 
 print(f"prompt: {prompt}")
 print(f"number of tokens in the prompt = {len(context)}")
 for token in context:
-    print(f"{token:5} -> '{tokenizer.decode(token)}'")
-print()
-print(f"sampling parameters: temp = {temp:6f}, top_k = {top_k}, top_p = {top_p:6f}")
-print()
+    print(f"{token:5} -> '{decode([token])}'")
 print()
 
-open('output.txt', 'w').write(tokenizer.decode(generate(neigh, context, max_new_tokens=200, streaming=True)))
+open('output.txt', 'w').write(decode(generate(neigh, context, max_new_tokens=200, streaming=True)))
