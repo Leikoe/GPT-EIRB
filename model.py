@@ -30,5 +30,5 @@ class GPTeirb:
         time.sleep(0.01)
 
         z = np.zeros(self.tokenizer.vocab_size(), dtype=np.float32)
-        z[tokenizer.encode(args)[1]] = 1.0
+        z[tokenizer.encode("owo")[1]] = 1.0
         return z
