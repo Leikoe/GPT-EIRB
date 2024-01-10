@@ -44,15 +44,17 @@ ZSTD_ALGO = "zstd"
 
 USED_ALGO = LZ4_ALGO
 
-gpu_compressor = numcodecs.registry.get_codec(dict(id=NVCOMP_CODEC_ID, algorithm=LZ4_ALGO))
+gpu_compressor = numcodecs.registry.get_codec(dict(id=NVCOMP_CODEC_ID, algorithm=USED_ALGO))
 cpu_compressor = numcodecs.registry.get_codec({"id": USED_ALGO.lower()})
 
 
 # hyperparameters
-n_train = 10000
+n_train = 1000
 n_ctx = 8  # what is the maximum context length for predictions?
 # ------------
 
+
+# *** taken and modified from https://github.com/karpathy/ng-video-lecture ***
 
 # wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
 with open('input.txt', 'r', encoding='utf-8') as f:
@@ -104,21 +106,21 @@ def encode_batch_size(codec: NvCompBatchCodec, bufs: Sequence[Any]) -> np.ndarra
     if num_chunks == 0:
         return []
 
-    print("converting to contiguous arrays")
+    # print("converting to contiguous arrays")
     buf_sizes = [b.size * b.itemsize for b in bufs]
     buf = cp.asarray(np.concatenate([b for b in bufs]))
 
     max_chunk_size = max(buf_sizes)
 
     # Get temp and output buffer sizes.
-    print("getting temp sizes")
+    # print("getting temp sizes")
     temp_size = codec._algo.get_compress_temp_size(num_chunks, max_chunk_size)
     comp_chunk_size = codec._algo.get_compress_chunk_size(max_chunk_size)
 
     # Prepare data and size buffers.
     # uncomp_chunks is used as a container that stores pointers to actual chunks.
     # nvCOMP requires this and sizes buffers to be in GPU memory.
-    print("preparing data and size buffers")
+    # print("preparing data and size buffers")
     uncomp_chunks = cp.array(np.concatenate((np.array([0]), np.cumsum(buf_sizes)[:-1])) + int(buf.data.ptr), dtype=cp.uintp)
     uncomp_chunk_sizes = cp.array(buf_sizes, dtype=cp.uint64)
 
@@ -130,7 +132,7 @@ def encode_batch_size(codec: NvCompBatchCodec, bufs: Sequence[Any]) -> np.ndarra
     # Resulting compressed chunk sizes.
     comp_chunk_sizes = cp.empty(num_chunks, dtype=cp.uint64)
 
-    print("calling compress")
+    # print("calling compress")
     codec._algo.compress(
         uncomp_chunks,
         uncomp_chunk_sizes,
@@ -176,7 +178,7 @@ print(f"Total examples: {len(XS_compressed_lens)}")
 compressed_pairs = np.empty((len(XS), len(XS)), dtype=np.float16) # those are the compressed lengths
 STEP = 100
 print(f"compressing {STEP} lines of {len(XS)} elements at a time (total {STEP*len(XS)} pairs each time)")
-with Timing("compressing pairs.."):
+with Timing("compressing pairs"):
     for i in tqdm.tqdm(range(0, len(XS), STEP)):
         chunk = XS[i: i + STEP]
         data = [np.concatenate((x1, np.array([0], dtype=np.uint8), x2)) for x1 in chunk for x2 in XS]
