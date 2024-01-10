@@ -93,7 +93,7 @@ def get_example(split):
     y = data[i+1:i+n_ctx+1]
     return x, y
 
-   
+
 def encode_batch_size(codec: NvCompBatchCodec, bufs: Sequence[Any]) -> np.ndarray: 
     """
     Compresses a batch of buffers using the given codec.
@@ -233,7 +233,7 @@ np.save("model_ys", YS)
 
 neigh.classes_ = np.arange(n_vocab, dtype=np.uint8)
 
-prompt = "Citi"
+prompt = "A"
 context = np.array(encode(prompt), dtype=np.uint8)
 
 print(f"prompt: {prompt}")
