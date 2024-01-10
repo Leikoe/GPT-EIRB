@@ -36,6 +36,6 @@ pip install -r requirements.txt
 ## Usage
 
 ```shell
-python3 download.py # Optionnal: downloads the TinyStories 
+python3 download.py # Optionnal: downloads the TinyStories dataset and create input.txt
 python3 train.py # launch the training and generate a few tokens to stdin + write them into output.txt
 ```
